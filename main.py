@@ -72,7 +72,9 @@ DEFAULT_IMAGE_HASH_THRESHOLD = 0.90       # 图片哈希相似度阈值（dHash 
 DEFAULT_MIN_UNIQUE_SENDERS = 3            # 最少不同发送者数量
 DEFAULT_COOLDOWN_SECONDS = 3600           # 冷却时间（秒）
 DEFAULT_MIN_TEXT_LENGTH = 2               # 最小文本长度
+DEFAULT_FILTER_BY_MESSAGE_TYPE = True     # 默认基于消息类型自动过滤表情包
 REMINDER_IMAGE_FILENAME = "1000101866.jpg" # 提醒图片文件名
+STICKER_SUMMARIES = {"[动画表情]", "[商城表情]", "[表情]", "[贴纸表情]", "[超级表情]", "[大表情]"}
 
 
 # ==============================================================================
@@ -1204,16 +1206,156 @@ class MemoryRebootPlugin(Star):
             chain.append(Plain("这个话题之前已经有人讨论过了哦~"))
         yield event.chain_result(chain)
     
+    def _get_clean_text(self, text: str) -> str:
+        """移除CQ码和表情包占位符后的实际文本"""
+        if not text:
+            return ""
+        # 移除 CQ 码：按 [CQ: 切分
+        parts = text.split("[CQ:")
+        cleaned = parts[0]
+        for part in parts[1:]:
+            if "]" in part:
+                cleaned += part[part.rfind("]") + 1:]
+        # 移除各种表情占位符
+        for s in STICKER_SUMMARIES:
+            cleaned = cleaned.replace(s, "")
+        return cleaned.strip()
+
+    def _is_sticker_by_message_type(self, event: AstrMessageEvent) -> bool:
+        """
+        基于消息类型与元数据判断整条消息是否为纯表情包。
+        针对 QQ / OneBot 协议中的动画表情、商城表情、大表情、系统表情等进行特征识别。
+        """
+        text = event.message_str.strip() if event.message_str else ""
+        has_real_text = bool(self._get_clean_text(text))
+        
+        # 如果有真实的文字内容，则整条消息不算纯表情包
+        if has_real_text:
+            return False
+
+        # 检查是否全部是表情类组件
+        components = []
+        if hasattr(event, "message_obj") and event.message_obj:
+            components = getattr(event.message_obj, "message", []) or []
+            
+        # 若组件全为 Face / MarketFace 等，直接判定为纯表情包
+        if components and all(c.__class__.__name__ in ("Face", "MarketFace", "MFace", "BFace", "Dice", "RPS", "Poke") for c in components):
+            return True
+
+        # 检查底层 raw_message
+        raw_msg = getattr(event.message_obj, "raw_message", None) if hasattr(event, "message_obj") else None
+        if raw_msg is None:
+            raw_msg = getattr(event, "raw_message", None)
+            
+        raw_str = ""
+        if isinstance(raw_msg, str):
+            raw_str = raw_msg
+        elif isinstance(raw_msg, dict):
+            raw_str = str(raw_msg.get("raw_message", ""))
+
+        if raw_str:
+            if re.search(r"\[CQ:(mface|bface|face)", raw_str, re.I):
+                return True
+            if "动画表情" in raw_str or "商城表情" in raw_str or "贴纸表情" in raw_str:
+                return True
+            if re.search(r"sub_?type=['\"]?[178]['\"]?", raw_str, re.I):
+                return True
+
+        # 如果没有真实文字，且 text 原本就是表情占位符
+        if text and not has_real_text:
+            return True
+            
+        return False
+
+    def _is_image_component_sticker(self, comp: Any, event: AstrMessageEvent, total_images: int = 1) -> bool:
+        """
+        基于组件属性及 raw_message 判断单张图片是否为表情包/动画表情/贴纸。
+        """
+        # 1. 检查组件类名
+        comp_type = comp.__class__.__name__
+        if comp_type in ("Face", "MarketFace", "MFace", "BFace", "Dice", "RPS", "Poke"):
+            return True
+            
+        # 2. 检查组件自身属性 (如 summary, sub_type)
+        summary = str(getattr(comp, "summary", "") or "")
+        if "动画表情" in summary or "商城表情" in summary or any(s in summary for s in STICKER_SUMMARIES):
+            return True
+        sub_type = str(getattr(comp, "sub_type", getattr(comp, "subType", "0")))
+        if sub_type in ("1", "7", "8"):
+            return True
+            
+        # 3. 结合 raw_message 判断
+        raw_msg = getattr(event.message_obj, "raw_message", None) if hasattr(event, "message_obj") else None
+        if raw_msg is None:
+            raw_msg = getattr(event, "raw_message", None)
+            
+        file_val = str(getattr(comp, "file", "") or "")
+        url_val = str(getattr(comp, "url", "") or "")
+        
+        if isinstance(raw_msg, dict):
+            segments = raw_msg.get("message", [])
+            if isinstance(segments, list):
+                for seg in segments:
+                    if isinstance(seg, dict) and seg.get("type") == "image":
+                        data = seg.get("data", {})
+                        if isinstance(data, dict):
+                            seg_file = str(data.get("file", ""))
+                            seg_url = str(data.get("url", ""))
+                            if (file_val and file_val in seg_file) or (url_val and url_val in seg_url) or (total_images <= 1):
+                                seg_summary = str(data.get("summary", ""))
+                                if "动画表情" in seg_summary or "商城表情" in seg_summary or any(s in seg_summary for s in STICKER_SUMMARIES):
+                                    return True
+                                seg_sub_type = str(data.get("sub_type", data.get("subType", "0")))
+                                if seg_sub_type in ("1", "7", "8"):
+                                    return True
+        elif isinstance(raw_msg, str):
+            segments = raw_msg.split("[CQ:")
+            for seg in segments:
+                if not seg.startswith("image,"):
+                    continue
+                matched = False
+                if file_val and file_val in seg:
+                    matched = True
+                elif url_val and url_val in seg:
+                    matched = True
+                elif total_images <= 1:
+                    matched = True
+                    
+                if matched:
+                    if "动画表情" in seg or "商城表情" in seg or "贴纸表情" in seg:
+                        return True
+                    if re.search(r"sub_?type=['\"]?[178]['\"]?", seg, re.I):
+                        return True
+                    
+        return False
+
     async def _extract_content(self, event: AstrMessageEvent) -> Optional[Tuple[str, Optional[str]]]:
         """提取消息内容，返回(文本内容, 图片URL)"""
-        text = event.message_str.strip() if event.message_str else ""
-        urls = []
+        filter_by_type = self.config.get("filter_by_message_type", DEFAULT_FILTER_BY_MESSAGE_TYPE)
+        
+        # 1. 若开启消息类型过滤，且整条消息判定为纯表情包，直接跳过
+        if filter_by_type and self._is_sticker_by_message_type(event):
+            logger.info("[Memory Reboot] 根据消息类型识别为表情包，已跳过")
+            return None
+        
+        raw_text = event.message_str.strip() if event.message_str else ""
+        text = self._get_clean_text(raw_text) if filter_by_type else raw_text
+        
+        images = []
         if hasattr(event, "message_obj") and event.message_obj:
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):
-                    url = getattr(comp, "url", None) or getattr(comp, "file", None)
-                    if url:
-                        urls.append(url)
+                    images.append(comp)
+        
+        total_images = len(images)
+        urls = []
+        for comp in images:
+            if filter_by_type and self._is_image_component_sticker(comp, event, total_images):
+                logger.info("[Memory Reboot] 根据消息类型识别图片为表情包，已跳过")
+                continue
+            url = getattr(comp, "url", None) or getattr(comp, "file", None)
+            if url:
+                urls.append(url)
         
         if urls:
             for url in urls:
