@@ -12,7 +12,7 @@ import hashlib
 import datetime
 import shutil
 import gzip
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 
 # ----- 1.2 第三方库（带依赖检查）-----
 _missing_deps = []  # 记录缺失的依赖
